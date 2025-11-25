@@ -10,7 +10,6 @@ from collections import deque
 import resources
 import shutil
 
-# 性能配置
 LOGS_DIR = "logs"
 ADB_PATHS_FILE = "emulated.txt"
 PACKAGES_FILE = "packages.txt"
@@ -342,7 +341,7 @@ class CatchLogFrame(wx.Frame):
         self.logCtrl.Bind(wx.EVT_MOUSEWHEEL, self.on_log_scroll)
         self.logCtrl.Bind(wx.EVT_KEY_DOWN, self.on_log_scroll)
 
-        self.default_style = self.logCtrl.GetDefaultStyle()
+        self.default_style = wx.TextAttr("black", "white")
         self.highlight_style = wx.TextAttr("black", "yellow")
         self.primary_highlight_style = wx.TextAttr("white", "blue")
 
@@ -670,7 +669,6 @@ class CatchLogFrame(wx.Frame):
             # 如果检测失败（比如空窗口），假设我们在最后一行
             current_vis_bottom_line = total_lines
         is_at_bottom = (current_vis_bottom_line == total_lines)
-        print('当前值、最大行号', current_vis_bottom_line, total_lines)
         return is_at_bottom
 
     def on_log_scroll(self, event):
@@ -780,7 +778,7 @@ class CatchLogFrame(wx.Frame):
         wx.CallAfter(self.sync_autoscroll_checkbox_to_view)
 
     def _jump_to_current_match(self, old_index=None):
-        """高亮当前搜索匹配项并滚动到该位置"""
+        """高亮搜索匹配项并滚动到该位置"""
         if old_index is not None and old_index != self.search_manager.current_index:
             try:
                 prev_s, prev_e = self.search_manager.results[old_index]
