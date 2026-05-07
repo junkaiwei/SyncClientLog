@@ -512,7 +512,7 @@ class RemoteFilePickerDialog(wx.Dialog):
 
 class CatchLogFrame(wx.Frame):
     def __init__(self):
-        super().__init__(None, title="IKUN LogCatch V3.0", size=(1050, 750))
+        super().__init__(None, title="IKUN LogCatch V3.1", size=(1050, 750))
         os.makedirs(LOGS_DIR, exist_ok=True)
         try:
             self.SetIcon(resources.AppIcon.GetIcon())
