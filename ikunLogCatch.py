@@ -84,10 +84,6 @@ class SearchResultManager:
         return bool(self.results)
 
 
-# =============================================================================
-# --- 业务逻辑控制器 (Business Logic Controller) ---
-# =============================================================================
-
 class AdbController:
     """封装所有ADB命令的执行逻辑"""
 
@@ -150,9 +146,35 @@ class AdbController:
             cmd.extend(['--pid', pid])
         return cmd
 
-    def pull_log(self, serial, package_name, dest_path):
+    def list_remote_files(self, serial, package_name):
+        """递归列出 Android/data 下的子文件 (包含 files, cache 等)"""
+        # 尝试列出整个包目录，深度增加
+        base_path = f"/storage/emulated/0/Android/data/{package_name}"
+        try:
+            # 使用 find 命令列出所有文件，最大深度 4
+            # 同时获取文件大小和修改时间 (通过 ls -l)
+            # 注意：某些精简版系统不支持 find -exec，这里先尝试简单列出
+            cmd = ['-s', serial, 'shell', f'find {base_path} -type f -maxdepth 4']
+            result = self._run_command(cmd, timeout=15)
+            if result.returncode != 0:
+                # 如果 find 失败，可能是路径不存在或 find 不可用，尝试 ls -R
+                cmd = ['-s', serial, 'shell', f'ls -R {base_path}']
+                # ls -R 的解析比较复杂，这里暂时还是以 find 为主
+                return []
+            
+            files = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            return files
+        except Exception as e:
+            print(f"列出远程文件失败: {e}")
+            return []
+
+    def get_file_content_command(self, serial, remote_path, lines=1000):
+        """构建用于拉取文件最新内容的 shell 命令"""
+        return ['-s', serial, 'shell', 'tail', '-n', str(lines), remote_path]
+
+    def pull_log(self, serial, package_name, dest_path, remote_path=None):
         """从设备拉取日志文件"""
-        src = f"/storage/emulated/0/Android/data/{package_name}/files/outLog.txt"
+        src = remote_path if remote_path else f"/storage/emulated/0/Android/data/{package_name}/files/outLog.txt"
         try:
             self._run_command(["-s", serial, "pull", src, dest_path], timeout=30, check=True)
             return True, f"日志导出成功:\n{os.path.abspath(dest_path)}"
@@ -166,10 +188,11 @@ class AdbController:
 
 # 多线程日志
 class LogThread(threading.Thread):
-    def __init__(self, parent, cmd):
+    def __init__(self, parent, cmd, encoding='utf-8'):
         super().__init__(daemon=True)
         self.parent = weakref.ref(parent)
         self.cmd = cmd
+        self.encoding = encoding
         self.stop_event = threading.Event()
         self.proc = None
         self.buffer = []
@@ -179,7 +202,7 @@ class LogThread(threading.Thread):
         try:
             self.proc = subprocess.Popen(
                 self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding='utf-8', errors='ignore',
+                text=True, encoding=self.encoding, errors='ignore',
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
             for line in iter(self.proc.stdout.readline, ''):
@@ -211,6 +234,56 @@ class LogThread(threading.Thread):
                 self.proc.terminate()
             except Exception:
                 pass
+
+
+# 轮询式文件监控线程
+class FilePollingThread(threading.Thread):
+    def __init__(self, parent, adb_controller, serial, remote_path, encoding='utf-8'):
+        super().__init__(daemon=True)
+        self.parent = weakref.ref(parent)
+        self.adb_controller = adb_controller
+        self.serial = serial
+        self.remote_path = remote_path
+        self.encoding = encoding
+        self.stop_event = threading.Event()
+        self.refresh_event = threading.Event()
+
+    def run(self):
+        # 执行初始刷新
+        self._do_single_refresh()
+
+        while not self.stop_event.is_set():
+            # 等待刷新信号或停止信号
+            self.refresh_event.wait()
+            if self.stop_event.is_set(): break
+
+            self._do_single_refresh()
+            self.refresh_event.clear()
+
+        parent = self.parent()
+        if parent: wx.CallAfter(parent.on_logging_stopped)
+
+    def _do_single_refresh(self):
+        try:
+            cmd = self.adb_controller.get_file_content_command(self.serial, self.remote_path)
+            result = self.adb_controller._run_command(cmd, timeout=5)
+
+            if result.returncode == 0:
+                content = result.stdout
+                # 通过父窗口更新 UI
+                parent = self.parent()
+                if parent:
+                    wx.CallAfter(parent.refresh_file_content, content)
+
+        except Exception as e:
+            print(f"执行刷新失败: {e}")
+
+    def trigger_refresh(self):
+        self.refresh_event.set()
+
+    def stop(self):
+        self.stop_event.set()
+        self.refresh_event.set()  # 唤醒等待
 
 
 # 包名列表对话框
@@ -295,9 +368,151 @@ class PackageListDialog(wx.Dialog):
         return self.alias, self.selected_package
 
 
+class RemoteFilePickerDialog(wx.Dialog):
+    """远程文件选择对话框 (优化：使用目录树)"""
+    def __init__(self, parent, adb_controller, serial, package_name):
+        super().__init__(parent, title=f"选择监控文件 - {package_name}", size=(650, 500))
+        self.adb_controller = adb_controller
+        self.serial = serial
+        self.package_name = package_name
+        self.selected_file = None
+        self.all_files = []
+
+        self.init_ui()
+        
+        # 初始加载
+        wx.CallAfter(self.load_files)
+
+    def init_ui(self):
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # 顶部工具栏：搜索和刷新
+        top_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        top_sizer.Add(wx.StaticText(panel, label="过滤文件:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.search_ctrl = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
+        self.search_ctrl.Bind(wx.EVT_TEXT, self.on_filter)
+        top_sizer.Add(self.search_ctrl, 1, wx.EXPAND | wx.RIGHT, 10)
+        
+        self.refresh_btn = wx.Button(panel, label="刷新目录", size=(80, -1))
+        self.refresh_btn.Bind(wx.EVT_BUTTON, lambda e: self.load_files())
+        top_sizer.Add(self.refresh_btn, 0, wx.EXPAND)
+        
+        sizer.Add(top_sizer, 0, wx.EXPAND | wx.ALL, 10)
+
+        # 文件树控件
+        self.file_tree = wx.TreeCtrl(panel, style=wx.TR_HAS_BUTTONS | wx.TR_SINGLE | wx.TR_HIDE_ROOT)
+        self.file_tree.Bind(wx.EVT_TREE_ITEM_ACTIVATED, self.on_item_activated)
+        sizer.Add(self.file_tree, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+
+        # 说明文字
+        tip = wx.StaticText(panel, label="提示: 展开目录并双击文件名，或选择后点击确认开始监控。")
+        tip.SetForegroundColour(wx.Colour(128, 128, 128))
+        sizer.Add(tip, 0, wx.ALL, 10)
+
+        # 底部按钮
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.ok_btn = wx.Button(panel, wx.ID_OK, label="确认监控")
+        self.ok_btn.Bind(wx.EVT_BUTTON, self.on_ok)
+        cancel_btn = wx.Button(panel, wx.ID_CANCEL, label="取消")
+        btn_sizer.Add(self.ok_btn, 0, wx.RIGHT, 10)
+        btn_sizer.Add(cancel_btn, 0)
+        
+        sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+
+        panel.SetSizer(sizer)
+
+    def load_files(self):
+        self.ok_btn.Disable()
+        self.refresh_btn.Disable()
+        self.file_tree.DeleteAllItems()
+        self.SetTitle(f"正在同步远程文件变动... - {self.package_name}")
+        
+        def do_load():
+            files = self.adb_controller.list_remote_files(self.serial, self.package_name)
+            wx.CallAfter(self._update_tree, files)
+
+        threading.Thread(target=do_load, daemon=True).start()
+
+    def _update_tree(self, files):
+        self.all_files = files
+        self.build_tree()
+        self.ok_btn.Enable()
+        self.refresh_btn.Enable()
+        self.SetTitle(f"选择监控文件 - {self.package_name}")
+        if not files:
+            root = self.file_tree.AddRoot("Root")
+            self.file_tree.AppendItem(root, "未找到文件，请尝试刷新或确认应用已启动")
+
+    def build_tree(self):
+        self.file_tree.DeleteAllItems()
+        root = self.file_tree.AddRoot("Root")
+        
+        filter_text = self.search_ctrl.GetValue().lower()
+        prefix = f"/storage/emulated/0/Android/data/{self.package_name}/"
+        
+        # 用于存储节点，避免重复创建
+        nodes = {"": root}
+
+        for f in sorted(self.all_files):
+            if filter_text and filter_text not in f.lower():
+                continue
+            
+            # 去掉前缀，处理相对路径
+            rel_path = f.replace(prefix, "")
+            parts = rel_path.split("/")
+            
+            current_path = ""
+            for i, part in enumerate(parts):
+                parent_path = current_path
+                current_path = f"{current_path}/{part}" if current_path else part
+                
+                if current_path not in nodes:
+                    parent_node = nodes[parent_path]
+                    new_node = self.file_tree.AppendItem(parent_node, part)
+                    nodes[current_path] = new_node
+                    
+                    # 如果是最后一个部分（文件），关联原始完整路径
+                    if i == len(parts) - 1:
+                        self.file_tree.SetItemData(new_node, f)
+        
+        # 自动展开有内容的节点
+        self.file_tree.ExpandAll()
+
+    def on_filter(self, event):
+        self.build_tree()
+
+    def on_item_activated(self, event):
+        self.on_ok(None)
+
+    def on_ok(self, event):
+        item = self.file_tree.GetSelection()
+        if item.IsOk():
+            full_path = self.file_tree.GetItemData(item)
+            if full_path:  # 只有文件节点才有 Data
+                self.selected_file = full_path
+                self.EndModal(wx.ID_OK)
+                return
+            else:
+                # 如果点的是目录，则切换展开状态
+                if self.file_tree.IsExpanded(item):
+                    self.file_tree.Collapse(item)
+                else:
+                    self.file_tree.Expand(item)
+                return
+        
+        if not self.all_files:
+            self.EndModal(wx.ID_CANCEL)
+        else:
+            wx.MessageBox("请从树中双击选择一个文件进行监控", "提示")
+
+    def get_selected_file(self):
+        return self.selected_file
+
+
 class CatchLogFrame(wx.Frame):
     def __init__(self):
-        super().__init__(None, title="IKUN LogCatch V3.0", size=(900, 700))
+        super().__init__(None, title="IKUN LogCatch V3.0", size=(1050, 750))
         os.makedirs(LOGS_DIR, exist_ok=True)
         try:
             self.SetIcon(resources.AppIcon.GetIcon())
@@ -388,10 +603,11 @@ class CatchLogFrame(wx.Frame):
         return grid
 
     def _create_control_sizer(self, panel):
-        """创建中间控制区域 (按钮, 搜索)"""
-        sizer = wx.BoxSizer(wx.HORIZONTAL)
-
-        # 主要控制按钮
+        """创建中间控制区域 (按钮, 搜索) - 优化布局为两行"""
+        main_ctrl_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # 第一行：功能按钮
+        row1_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.startButton = wx.Button(panel, label="开始抓取")
         self.startButton.Bind(wx.EVT_BUTTON, self.on_start_stop)
         self.clearBtn = wx.Button(panel, label="清空显示")
@@ -400,14 +616,31 @@ class CatchLogFrame(wx.Frame):
         self.exportBtn.Bind(wx.EVT_BUTTON, self.export_realtime)
         self.pullBtn = wx.Button(panel, label="导出应用日志")
         self.pullBtn.Bind(wx.EVT_BUTTON, self.export_package_log)
+        self.monitorBtn = wx.Button(panel, label="监控文件")
+        self.monitorBtn.Bind(wx.EVT_BUTTON, self.on_monitor_file)
+        self.reloadBtn = wx.Button(panel, label="刷新")
+        self.reloadBtn.Bind(wx.EVT_BUTTON, self.on_reload_file)
+        self.reloadBtn.Disable()
+        self.openLogsBtn = wx.Button(panel, label="打开日志目录")
+        self.openLogsBtn.Bind(wx.EVT_BUTTON, self.on_open_logs_dir)
+
+        for btn in [self.startButton, self.clearBtn, self.exportBtn, self.pullBtn, self.monitorBtn, self.reloadBtn, self.openLogsBtn]:
+            row1_sizer.Add(btn, 0, wx.RIGHT, 5)
+        
+        row1_sizer.AddStretchSpacer(1)
+        
+        # 第二行：设置和搜索
+        row2_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        
+        row2_sizer.Add(wx.StaticText(panel, label="编码:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.encodingChoice = wx.Choice(panel, choices=["UTF-8", "GBK"])
+        self.encodingChoice.SetSelection(0)
+        row2_sizer.Add(self.encodingChoice, 0, wx.RIGHT, 15)
+
         self.autoScroll = wx.CheckBox(panel, label="自动滚动")
         self.autoScroll.SetValue(True)
         self.autoScroll.Bind(wx.EVT_CHECKBOX, self.on_autoscroll_checkbox_manual_toggle)
-
-        for btn in [self.startButton, self.clearBtn, self.exportBtn, self.pullBtn]:
-            sizer.Add(btn, 0, wx.ALL, 5)
-        sizer.Add(self.autoScroll, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-        sizer.AddStretchSpacer(1)
+        row2_sizer.Add(self.autoScroll, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 20)
 
         # 搜索控件
         self.searchCtrl = wx.SearchCtrl(panel, style=wx.TE_PROCESS_ENTER)
@@ -416,6 +649,7 @@ class CatchLogFrame(wx.Frame):
         self.searchCtrl.Bind(wx.EVT_TEXT, self.on_search)
         self.searchCtrl.ShowCancelButton(True)
         self.searchCtrl.Bind(wx.EVT_SEARCH_CANCEL, self.on_cancel_search)
+        
         self.regexCheck = wx.CheckBox(panel, label="正则")
         self.regexCheck.Bind(wx.EVT_CHECKBOX, self.on_regex_check)
         self.prevBtn = wx.Button(panel, label="↑", size=(30, -1))
@@ -424,12 +658,16 @@ class CatchLogFrame(wx.Frame):
         self.nextBtn.Bind(wx.EVT_BUTTON, self.on_find_next)
         self.prevBtn.Disable()
         self.nextBtn.Disable()
-        sizer.Add(self.searchCtrl, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 5)
-        sizer.Add(self.regexCheck, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 5)
-        sizer.Add(self.prevBtn, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 5)
-        sizer.Add(self.nextBtn, 0, wx.ALIGN_CENTER_VERTICAL)
+        
+        row2_sizer.Add(self.searchCtrl, 1, wx.EXPAND | wx.RIGHT, 5)
+        row2_sizer.Add(self.regexCheck, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        row2_sizer.Add(self.prevBtn, 0, wx.RIGHT, 5)
+        row2_sizer.Add(self.nextBtn, 0)
 
-        return sizer
+        main_ctrl_sizer.Add(row1_sizer, 0, wx.EXPAND | wx.BOTTOM, 8)
+        main_ctrl_sizer.Add(row2_sizer, 0, wx.EXPAND | wx.BOTTOM, 5)
+
+        return main_ctrl_sizer
 
     def on_adb_select(self, event):
         """处理ADB路径选择变更"""
@@ -461,6 +699,94 @@ class CatchLogFrame(wx.Frame):
                 self.deviceChoice.Append(dev_name, line)
             self.deviceChoice.SetSelection(0)
             self.SetStatusText(f"找到 {len(result)} 个设备")
+
+    def on_monitor_file(self, event):
+        """选择并实时监控应用内部文件"""
+        idx = self.deviceChoice.GetSelection()
+        if idx == wx.NOT_FOUND or "设备" in self.deviceChoice.GetStringSelection().lower():
+            wx.MessageBox("请先从'目标设备'下拉列表中选择一个有效设备。", "提示", wx.OK | wx.ICON_INFORMATION)
+            return
+
+        serial = self.deviceChoice.GetClientData(idx).split('\t')[0]
+        pkg = self.package_name.strip()
+
+        if not pkg:
+            wx.MessageBox("请先输入或从下拉框选择包名。", "提示", wx.OK | wx.ICON_INFORMATION)
+            return
+
+        with RemoteFilePickerDialog(self, self.adb_controller, serial, pkg) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                remote_path = dlg.get_selected_file()
+                if remote_path:
+                    self.start_file_monitoring(serial, remote_path)
+
+    def on_reload_file(self, event):
+        """手动触发文件刷新"""
+        if self.is_logging and isinstance(self.log_thread, FilePollingThread):
+            self.log_thread.trigger_refresh()
+            self.SetStatusText(f"已发送刷新请求: {time.strftime('%H:%M:%S')}")
+
+    def start_file_monitoring(self, serial, remote_path):
+        """停止当前日志抓取，开始轮询式监控特定文件"""
+        if self.is_logging:
+            if self.log_thread:
+                self.log_thread.stop()
+
+        try:
+            self.session_log_file = open(self.session_log_path, 'w', encoding='utf-8', errors='ignore')
+        except IOError as e:
+            wx.MessageBox(f"无法创建会话日志文件: {e}", "文件错误")
+            return
+
+        self.clear_log()
+        self.is_logging = True
+        self.startButton.SetLabel("停止抓取")
+        self.toggle_controls(False)
+
+        enc = self.encodingChoice.GetStringSelection().lower()
+        self.log_thread = FilePollingThread(self, self.adb_controller, serial, remote_path, encoding=enc)
+        self.log_thread.start()
+        self.reloadBtn.Enable()
+        self.SetStatusText(f"正在实时监控文件: {remote_path}")
+
+    def refresh_file_content(self, content):
+        """清空显示区并写入最新的文件内容快照"""
+        if not self.is_logging: return
+
+        self.logCtrl.Clear()
+        self.logCtrl.AppendText(content)
+
+        # 同时写入临时日志文件
+        if self.session_log_file and not self.session_log_file.closed:
+            try:
+                self.session_log_file.seek(0)
+                self.session_log_file.truncate()
+                self.session_log_file.write(content)
+            except Exception as e:
+                print(f"写入会话日志出错: {e}")
+
+        # 如果有搜索词，重新应用高亮
+        if self.search_term:
+            self._update_highlights(self.search_term, 0, self.logCtrl.GetLastPosition())
+
+        if self.autoScroll.IsChecked():
+            self.logCtrl.ShowPosition(self.logCtrl.GetLastPosition())
+
+    def on_open_logs_dir(self, event):
+
+        """打开本地日志存储目录"""
+        abs_path = os.path.abspath(LOGS_DIR)
+        if not os.path.exists(abs_path):
+            os.makedirs(abs_path, exist_ok=True)
+        
+        if os.name == 'nt':
+            os.startfile(abs_path)
+        else:
+            # 兼容其他系统
+            try:
+                subprocess.run(['open' if os.uname().sysname == 'Darwin' else 'xdg-open', abs_path])
+            except Exception as e:
+                print(f"打开目录失败: {e}")
 
     def on_package_change(self, event):
         """从包名输入框更新内部包名状态"""
@@ -550,7 +876,8 @@ class CatchLogFrame(wx.Frame):
         self.toggle_controls(False)
 
         cmd = self.adb_controller.build_logcat_command(serial, pid)
-        self.log_thread = LogThread(self, cmd)
+        enc = self.encodingChoice.GetStringSelection().lower()
+        self.log_thread = LogThread(self, cmd, encoding=enc)
         self.log_thread.start()
         self.SetStatusText("日志抓取中...")
 
@@ -565,6 +892,7 @@ class CatchLogFrame(wx.Frame):
             self.session_log_file = None
         self.startButton.SetLabel("开始抓取")
         self.startButton.Enable(True)
+        self.reloadBtn.Disable()
         self.toggle_controls(True)
         self.SetStatusText("日志停止。")
 
@@ -575,6 +903,8 @@ class CatchLogFrame(wx.Frame):
         self.adbCombo.Enable(enable)
         self.refreshBtn.Enable(enable)
         self.listPackagesBtn.Enable(enable)
+        self.monitorBtn.Enable(enable)
+        self.encodingChoice.Enable(enable)
 
     def update_log_text(self, lines, text_to_append=""):
         scroll_status = self._get_view_status()
