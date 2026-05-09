@@ -753,24 +753,31 @@ class CatchLogFrame(wx.Frame):
         """清空显示区并写入最新的文件内容快照"""
         if not self.is_logging: return
 
-        self.logCtrl.Clear()
-        self.logCtrl.AppendText(content)
+        self.logCtrl.Freeze()
+        try:
+            self.logCtrl.Clear()
+            self.logCtrl.AppendText(content)
 
-        # 同时写入临时日志文件
-        if self.session_log_file and not self.session_log_file.closed:
-            try:
-                self.session_log_file.seek(0)
-                self.session_log_file.truncate()
-                self.session_log_file.write(content)
-            except Exception as e:
-                print(f"写入会话日志出错: {e}")
+            # 同时写入临时日志文件
+            if self.session_log_file and not self.session_log_file.closed:
+                try:
+                    self.session_log_file.seek(0)
+                    self.session_log_file.truncate()
+                    self.session_log_file.write(content)
+                except Exception as e:
+                    print(f"写入会话日志出错: {e}")
 
-        # 如果有搜索词，重新应用高亮
-        if self.search_term:
-            self._update_highlights(self.search_term, 0, self.logCtrl.GetLastPosition())
+            # 如果有搜索词，重新应用高亮并清空旧的搜索偏移缓存
+            if self.search_term:
+                # 传入 skip_clear=True 因为 Clear() 已经清除了所有样式，避免二次全量清除导致卡顿
+                self._update_highlights(self.search_term, 0, self.logCtrl.GetLastPosition(), 
+                                        initial_scan=True, content=content, skip_clear=True)
 
-        if self.autoScroll.IsChecked():
-            self.logCtrl.ShowPosition(self.logCtrl.GetLastPosition())
+            if self.autoScroll.IsChecked():
+                self.logCtrl.ShowPosition(self.logCtrl.GetLastPosition())
+        finally:
+            self.logCtrl.Thaw()
+            self.logCtrl.Update() # 强制立即重绘，防止白屏展示延迟
 
     def on_open_logs_dir(self, event):
 
@@ -1068,28 +1075,39 @@ class CatchLogFrame(wx.Frame):
             self.nextBtn.Disable()
         wx.CallAfter(self.sync_autoscroll_checkbox_to_view)
 
-    def _update_highlights(self, term, start_pos, end_pos, initial_scan=False):
+    def _update_highlights(self, term, start_pos, end_pos, initial_scan=False, content=None, skip_clear=False):
         """在指定文本范围内查找并应用高亮。"""
         is_regex = self.regexCheck.IsChecked()
         pattern = self._get_compiled_pattern(term, is_regex)
         if not pattern:
             if is_regex: self.SetStatusText(f"无效的正则表达式: {term}")
             return
+        
         try:
-            content = self.logCtrl.GetRange(start_pos, end_pos)
+            if content is None:
+                content = self.logCtrl.GetRange(start_pos, end_pos)
         except wx.wxAssertionError:
             return
+        
         if not content: return
+        
         if initial_scan:
             self.search_manager.clear()
-            self._clear_all_highlights()
+            if not skip_clear:
+                self._clear_all_highlights()
+        
+        # 冻结控件以进行批量样式更新
+        self.logCtrl.Freeze()
         try:
             for m in pattern.finditer(content):
                 s, e = start_pos + m.start(), start_pos + m.end()
                 self.logCtrl.SetStyle(s, e, self.highlight_style)
                 self.search_manager.add_result(s, e)
         except (Exception, wx.wxAssertionError):
-            return
+            pass
+        finally:
+            self.logCtrl.Thaw()
+            
         if self.search_manager.has_results():
             self.SetStatusText(f"为 '{self.search_term}' 找到 {len(self.search_manager.results)} 个匹配项")
 
