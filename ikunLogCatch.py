@@ -114,6 +114,31 @@ class AdbController:
         except Exception as e:
             return f"获取设备列表失败: {e}"
 
+    def connect_device(self, address):
+        """主动连接网络设备，未指定端口时使用 ADB 默认端口。"""
+        address = address.strip()
+        match = re.fullmatch(r'([a-zA-Z0-9_.-]+)(?::([0-9]{1,5}))?', address)
+        if not match:
+            return False, "请输入 IP 或主机名，可附加端口，例如 127.0.0.1:5555", address
+        host, port = match.groups()
+        port = int(port or 5555)
+        if not 1 <= port <= 65535:
+            return False, "端口必须在 1 到 65535 之间", address
+        address = f"{host}:{port}"
+        try:
+            result = self._run_command(['connect', address], timeout=10)
+            message = '\n'.join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+            # adb connect 失败时也可能返回 0，必须同时检查连接结果。
+            success = result.returncode == 0 and any(
+                line.lower().startswith(('connected to ', 'already connected to '))
+                for line in result.stdout.splitlines()
+            )
+            return success, message or "ADB 未返回连接结果", address
+        except subprocess.TimeoutExpired:
+            return False, "连接设备超时，请检查地址、端口和网络", address
+        except Exception as e:
+            return False, f"连接设备失败: {e}", address
+
     def clear_logcat(self, serial):
         """清空设备日志"""
         try:
@@ -524,6 +549,8 @@ class CatchLogFrame(wx.Frame):
         self.packages = []
         self.log_thread = None
         self.is_logging = False
+        self.is_device_busy = False
+        self.last_device_address = "127.0.0.1:5555"
         self.session_log_file = None
         self.session_log_path = os.path.join(LOGS_DIR, SESSION_LOG_FILENAME)
 
@@ -582,9 +609,12 @@ class CatchLogFrame(wx.Frame):
         self.deviceChoice = wx.Choice(panel)
         self.refreshBtn = wx.Button(panel, label="刷新")
         self.refreshBtn.Bind(wx.EVT_BUTTON, self.refresh_devices)
+        self.connectBtn = wx.Button(panel, label="主动连接")
+        self.connectBtn.Bind(wx.EVT_BUTTON, self.on_connect_device)
         deviceSizer = wx.BoxSizer(wx.HORIZONTAL)
         deviceSizer.Add(self.deviceChoice, 1, wx.EXPAND)
         deviceSizer.Add(self.refreshBtn, 0, wx.LEFT, 5)
+        deviceSizer.Add(self.connectBtn, 0, wx.LEFT, 5)
         grid.Add(wx.StaticText(panel, label="目标设备:"), 0, wx.ALIGN_CENTER_VERTICAL)
         grid.Add(deviceSizer, 1, wx.EXPAND)
 
@@ -677,17 +707,56 @@ class CatchLogFrame(wx.Frame):
 
     def refresh_devices(self, event=None):
         """启动后台线程刷新设备列表"""
-        self.refreshBtn.Disable()
+        if self.is_device_busy or self.is_logging:
+            return
+        self.is_device_busy = True
+        self.toggle_controls(False)
+        self.startButton.Disable()
         self.SetStatusText("正在刷新设备列表...")
         threading.Thread(target=self._do_refresh_devices, daemon=True).start()
 
     def _do_refresh_devices(self):
         """后台工作方法，从ADB控制器获取设备"""
         devices_or_error = self.adb_controller.get_devices()
-        wx.CallAfter(self._update_device_list, devices_or_error)
-        wx.CallAfter(self.refreshBtn.Enable)
+        wx.CallAfter(self._on_device_operation_done, devices_or_error)
 
-    def _update_device_list(self, result):
+    def on_connect_device(self, event):
+        if self.is_device_busy or self.is_logging:
+            return
+        with wx.TextEntryDialog(self, "输入设备 IP/主机名和端口（默认 5555）：",
+                                "主动连接设备", self.last_device_address) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            address = dlg.GetValue().strip()
+        if not address:
+            wx.MessageBox("请输入设备地址。", "提示", wx.OK | wx.ICON_INFORMATION)
+            return
+        self.last_device_address = address
+        self.is_device_busy = True
+        self.toggle_controls(False)
+        self.startButton.Disable()
+        self.SetStatusText(f"正在连接 {address}...")
+        threading.Thread(target=self._do_connect_device, args=(address,), daemon=True).start()
+
+    def _do_connect_device(self, address):
+        success, message, serial = self.adb_controller.connect_device(address)
+        devices = self.adb_controller.get_devices() if success else None
+        wx.CallAfter(self._on_device_operation_done, devices, serial, success, message)
+
+    def _on_device_operation_done(self, devices, serial=None, success=None, message=""):
+        if not self:
+            return
+        self.is_device_busy = False
+        self.toggle_controls(not self.is_logging)
+        self.startButton.Enable()
+        if devices is not None:
+            self._update_device_list(devices, serial)
+        if success is not None:
+            self.SetStatusText(message)
+            if not success:
+                wx.MessageBox(message, "连接失败", wx.OK | wx.ICON_ERROR)
+
+    def _update_device_list(self, result, selected_serial=None):
         """在UI线程中更新设备下拉列表"""
         self.deviceChoice.Clear()
         if isinstance(result, str):  # 错误或无设备
@@ -698,6 +767,11 @@ class CatchLogFrame(wx.Frame):
                 dev_name = line.strip().split('\t')[0]
                 self.deviceChoice.Append(dev_name, line)
             self.deviceChoice.SetSelection(0)
+            if selected_serial:
+                for idx in range(self.deviceChoice.GetCount()):
+                    if self.deviceChoice.GetString(idx) == selected_serial:
+                        self.deviceChoice.SetSelection(idx)
+                        break
             self.SetStatusText(f"找到 {len(result)} 个设备")
 
     def on_monitor_file(self, event):
@@ -902,6 +976,7 @@ class CatchLogFrame(wx.Frame):
         self.packageCombo.Enable(enable)
         self.adbCombo.Enable(enable)
         self.refreshBtn.Enable(enable)
+        self.connectBtn.Enable(enable)
         self.listPackagesBtn.Enable(enable)
         self.monitorBtn.Enable(enable)
         self.encodingChoice.Enable(enable)
