@@ -1,0 +1,14 @@
+[project]
+name = "ikunlogcatch"
+version = "4.0.0"
+requires-python = ">=3.14"
+dependencies = [
+    "wxpython>=4.2.5",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["logcatch*"]
