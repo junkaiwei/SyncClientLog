@@ -54,7 +54,7 @@ def verify(executable):
             user32.PostMessageW(handle, 0x0010, 0, 0)  # WM_CLOSE
             if process.wait(timeout=15) != 0:
                 raise RuntimeError('EXE 退出异常')
-            print(f'独立 EXE 启动并正常关闭: {expected}；无外部 pyproject.toml')
+            print(f'Standalone EXE started and closed successfully: {expected}; no external pyproject.toml')
         finally:
             if process.poll() is None:
                 subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
