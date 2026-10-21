@@ -28,7 +28,6 @@ class WindowTests(unittest.TestCase):
         self.frame.Show()
         self.app.Yield()
         self.frame._start_session()
-
     def tearDown(self):
         self.frame.closing = True
         self.frame.session.discard()

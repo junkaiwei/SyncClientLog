@@ -18,7 +18,7 @@ def validate_version(value):
 
 
 def version_from_tag(tag):
-    return validate_version(tag[1:] if tag.startswith('v') else tag)
+    return validate_version(tag[1:] if tag.startswith(('v', 'V')) else tag)
 
 
 def metadata_path():

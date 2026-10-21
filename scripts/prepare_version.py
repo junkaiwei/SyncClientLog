@@ -15,7 +15,7 @@ def prepare_version(tag, project_path):
     get_version(project_path)
     text = project_path.read_text(encoding='utf-8')
     # Restrict replacement to [project], without reserializing other TOML fields.
-    match = re.search(r'(?ms)^\[project\]\s*\n(?P<body>.*?)(?=^\[|\Z)', text)
+    match = re.search(r'(?ms)^\[project]\s*\n(?P<body>.*?)(?=^\[|\Z)', text)
     if match is None:
         raise ValueError('缺少 [project]')
     body, count = re.subn(r'(?m)^(version\s*=\s*)["\'][^"\']*["\']',

@@ -17,9 +17,10 @@ from scripts.prepare_version import prepare_version
 class VersionTests(unittest.TestCase):
     def test_tag_versions(self):
         for tag, version in [('v3.1.0', '3.1.0'), ('3.1.0', '3.1.0'),
+                             ('V4.0.1', '4.0.1'), ('V4.0.1rc1', '4.0.1rc1'),
                              ('v3.2.0rc1', '3.2.0rc1'), ('3.2.0b2', '3.2.0b2')]:
             self.assertEqual(version_from_tag(tag), version)
-        for tag in ['v', '', 'release-3.1.0', '3.1', '3.1.0;echo', '3.01.0']:
+        for tag in ['v', 'V', '', 'release-3.1.0', '3.1', '3.1.0;echo', '3.01.0']:
             with self.assertRaises(ValueError):
                 version_from_tag(tag)
 
@@ -30,6 +31,8 @@ class VersionTests(unittest.TestCase):
                             '[tool.example]\nversion = "keep"\n', encoding='utf-8')
             self.assertEqual(prepare_version('v4.0.0rc1', file), '4.0.0rc1')
             self.assertEqual(get_version(file), '4.0.0rc1')
+            self.assertEqual(prepare_version('V4.0.1', file), '4.0.1')
+            self.assertEqual(get_version(file), '4.0.1')
             self.assertIn('version = "keep"', file.read_text(encoding='utf-8'))
             before = file.read_bytes()
             with self.assertRaises(ValueError):
